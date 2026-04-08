@@ -1,13 +1,15 @@
 """Pie menu: cascading donut rings with icon-only slices.
 
-Callback execution happens entirely in the view process — no
-cross-process serialisation of callables is needed.
+Callbacks fire on the **client** process.  The server resolves a leaf click
+and sends the ``action_name`` back.  The client looks up the registered
+callable and invokes it.
 """
 
 import math
 import numpy as np
 import pygfx as gfx
 from .d2 import Profile
+from .rpc import RpcError
 
 
 # ---------------------------------------------------------------------------
@@ -18,7 +20,7 @@ class _MenuSpec:
     """Serialisable description of one pie-menu slice.
 
     ``icon_verts`` — list of (x, y) points for the icon, or None
-    ``action``     — opaque string identifying the handler to call
+    ``action``     — string name identifying the client-side callable
     ``children``   — list of child _MenuSpec, or None
     """
 
@@ -29,14 +31,22 @@ class _MenuSpec:
             self.icon_verts = None
         self.action = action or ""
         self.children = (
-            [_MenuSpec(**vars(c)._asdict()) for c in children]
-            if isinstance(children, list) and len(children)
+            [_MenuSpec(**_spec_dict(c)) for c in children]
+            if children and len(children)
             else None
         )
 
 
+def _spec_dict(s):
+    """Convert a _MenuSpec or dict to kwargs."""
+    if isinstance(s, _MenuSpec):
+        return {"icon_verts": s.icon_verts, "action": s.action,
+                "children": s.children}
+    return s
+
+
 # ---------------------------------------------------------------------------
-# PieMenu (view-side renderer + interaction handler)
+# PieMenu (server-side renderer; event-driven, no cross-process calls)
 # ---------------------------------------------------------------------------
 
 class PieMenu:
@@ -44,29 +54,30 @@ class PieMenu:
 
     All rings share the same centre.  Ring 0 appears on request.
     Hovering a slice of ring *N* reveals ring *N+1* outside it.
-    The currently hovered slot is highlighted in gold.
+    Clicking a leaf sends the action name to the event handler.
     """
 
-    RING_W       = 55.0    # radial thickness per ring (screen px)
-    SLICE_GAP    = 0.03    # rad gap between slices
-    ICON_SCALE   = 0.45    # icon profile scale factor
-    RING1_INNER  = 30.0    # inner radius of first ring
-    SEG_PER_RAD  = 10
+    RING_W      = 55.0    # radial thickness per ring (screen px)
+    SLICE_GAP   = 0.03    # rad gap between slices
+    ICON_SCALE  = 0.45    # icon profile scale factor
+    RING1_INNER = 30.0    # inner radius of first ring
+    SEG_PER_RAD = 10
 
-    def __init__(self, actions: dict):
+    def __init__(self, on_click):
         """
         Parameters
         ----------
-        actions : dict
-            Maps action-name (str) → callable ``(x, y, shape_or_None)``.
+        on_click : callable(action_name, x, y, hit_uid|None)
+            Called when a leaf slice is clicked on the **server** side.
+            This function is responsible for forwarding the result
+            to the client process.
         """
-        self.actions = actions
-
+        self.on_click = on_click
         self.open = False
         self.center = (0.0, 0.0)
         self.scene: gfx.Scene | None = None
         self.group: gfx.Group | None = None
-        self._specs = []            # list of _MenuSpec
+        self._specs = []
         self._wedges: list[gfx.Mesh] = []
         self._icons: list[gfx.Mesh] = []
         self.hover_path: list[int] = []
@@ -104,8 +115,8 @@ class PieMenu:
             self.hover_path = path
             self._rebuild()
 
-    def handle_click(self, x: float, y: float) -> bool:
-        """If a leaf action is under the cursor, fire it and return True."""
+    def handle_click(self, x: float, y: float, hit_uid: str | None = None):
+        """If a leaf action is under the cursor, dispatch on_click."""
         if not self.open:
             return False
         path = self._path_for_point(x, y)
@@ -120,11 +131,9 @@ class PieMenu:
             spec = specs[idx]
             has_children = spec.children and len(spec.children) > 0
             if not has_children and spec.action:
-                handler = self.actions.get(spec.action)
-                if handler:
-                    handler(x, y, None)   # shape resolved via pick on demand
-                    self.close()
-                    return True
+                self.close()
+                self.on_click(spec.action, x, y, hit_uid)
+                return True
             specs = spec.children or []
         self.close()
         return True
@@ -132,7 +141,6 @@ class PieMenu:
     # ---- internals --------------------------------------------------------
 
     def _path_for_point(self, x: float, y: float) -> list[int] | None:
-        """Walk from ring 0 outward; return ring indices at (x, y) or None."""
         dx = x - self.center[0]
         dy = y - self.center[1]
         dist = math.sqrt(dx * dx + dy * dy)
@@ -181,7 +189,6 @@ class PieMenu:
                     icon = self._icon(spec.icon_verts, a_mid, r_mid)
                     self.group.add(icon)
                     self._icons.append(icon)
-            # next ring
             if 0 <= hl_idx < len(specs):
                 specs = specs[hl_idx].children or []
             else:
@@ -190,10 +197,7 @@ class PieMenu:
     def _wedge(self, r_inner, a_start, a_end, color):
         seg = max(3, int((a_end - a_start) * self.SEG_PER_RAD))
         angles = np.linspace(
-            a_start + self.SLICE_GAP / 2,
-            a_end - self.SLICE_GAP / 2,
-            seg,
-        )
+            a_start + self.SLICE_GAP / 2, a_end - self.SLICE_GAP / 2, seg)
         r_outer = r_inner + self.RING_W
         verts = []
         for a in angles:
@@ -204,9 +208,8 @@ class PieMenu:
         n = len(angles)
         indices = []
         for i in range(n - 1):
-            i0, i1 = i, i + 1
-            o0, o1 = 2 * n - 1 - i, 2 * n - 2 - i
-            indices.extend([i0, o0, i1, i1, o0, o1])
+            indices.extend([i, 2 * n - 1 - i, i + 1,
+                             i + 1, 2 * n - 1 - i, 2 * n - 2 - i])
         geo = gfx.Geometry(
             positions=positions,
             indices=np.array(indices, dtype=np.uint32),
@@ -218,15 +221,12 @@ class PieMenu:
         cx = radius * math.cos(angle)
         cy = radius * math.sin(angle)
         icon_verts = np.column_stack([
-            v[:, 0] + cx,
-            v[:, 1] + cy,
-            np.zeros(len(v), dtype=np.float32),
-        ])
+            v[:, 0] + cx, v[:, 1] + cy,
+            np.zeros(len(v), dtype=np.float32)])
         ic = []
         for i in range(1, len(icon_verts) - 1):
             ic.extend([0, i, i + 1])
         geo = gfx.Geometry(
             positions=icon_verts,
-            indices=np.array(ic, dtype=np.uint32),
-        )
+            indices=np.array(ic, dtype=np.uint32))
         return gfx.Mesh(geo, gfx.MeshBasicMaterial(color="#D0D0D0", side="both"))
