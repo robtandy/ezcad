@@ -1,5 +1,8 @@
 """Multiprocess viewer for ezcad with pie menu support."""
 
+import warnings
+warnings.filterwarnings("ignore", message="invalid value encountered in")
+
 import pygfx as gfx
 import io
 import trimesh
@@ -14,19 +17,10 @@ from .menu import PieMenu, _ItemSpec
 
 
 class View:
-    """Top-level viewer.  Starts lazily on first ``add()``."""
+    """Top-level viewer.  The pygfx window appears immediately on creation."""
 
     def __init__(self):
-        self.proc = None
         self.menu_items = []
-
-    def register_menu(self, menu_items):
-        """Register the root ``MenuItem`` list for the pie menu."""
-        self.menu_items = menu_items
-
-    def _ensure_running(self):
-        if self.proc is not None and self.proc.is_alive():
-            return
         from multiprocessing import Process, Queue
         self.queue = Queue()
         self.return_queue = Queue()
@@ -37,17 +31,18 @@ class View:
         )
         self.proc.start()
 
+    def register_menu(self, menu_items):
+        """Register the root ``MenuItem`` list for the pie menu."""
+        self.menu_items = menu_items
+
     def add(self, mesh: Mesh):
-        self._ensure_running()
         mesh.show_in(self)
 
     def open_menu_at(self, x: float, y: float):
-        self._ensure_running()
         specs = [_ItemSpec(it) for it in self.menu_items]
         self.queue.put(MenuOpenCmd(x, y, specs))
 
     def close_menu(self):
-        self._ensure_running()
         self.queue.put(MenuCloseCmd())
 
     def get_return(self):
