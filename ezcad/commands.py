@@ -40,24 +40,28 @@ class QuitCmd:
         sys.exit(0)
 
 
-class RequestMenuOpen:
-    """View → main: user right-clicked at (x, y).  Main should respond
-    with a ``MenuOpenCmd`` containing the items."""
-    def __init__(self, x, y, hit_shape_uuid=None):
-        self.x = x
-        self.y = y
-        self.hit_shape_uuid = hit_shape_uuid
+class RegisterActionCmd:
+    """Main → view: register a handler for a named action."""
+    def __init__(self, name):
+        self.name = name
+
+    def execute(self, v):
+        # The viewbkg pre-registers its handlers; this ensures the
+        # main-process side knows the action is ready.
+        pass
 
 
 class MenuOpenCmd:
-    """Main → view: open the pie menu at (x, y)."""
-    def __init__(self, x, y, item_specs):
+    """Main → view: open the pie menu at (x, y).
+    ``items`` is a nested structure of _MenuSpec that describes the tree.
+    """
+    def __init__(self, x, y, items):
         self.x = x
         self.y = y
-        self.item_specs = item_specs
+        self.items = items
 
     def execute(self, v):
-        v._open_menu(self.x, self.y, self.item_specs)
+        v._open_menu(self.x, self.y, self.items)
 
 
 class MenuCloseCmd:
@@ -68,10 +72,11 @@ class MenuCloseCmd:
         v._close_menu()
 
 
-class MenuClickCmd:
-    """View → main: user clicked a menu leaf."""
-    def __init__(self, item_id, x, y):
-        self.item_id = item_id
+class MenuMouseMoveCmd:
+    def __init__(self, x, y):
         self.x = x
         self.y = y
-        self.hit_shape_uuid = None
+
+    def execute(self, v):
+        if v._menu_open:
+            v.menu.handle_mouse(self.x, self.y)
