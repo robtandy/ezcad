@@ -34,7 +34,9 @@ class RenderWorld:
             self.scene.remove(old)
         self.scene.add(gmesh)
         self.gfx_map[mesh_impl.uid] = gmesh
-        self._resize_axes()
+        # Defer axes resize until there's actual content
+        if len(self.gfx_map) > 0:
+            self._resize_axes()
 
     def sync_visibility(self, uid, visible):
         gmesh = self.gfx_map.get(uid)
@@ -59,7 +61,12 @@ class RenderWorld:
         return None
 
     def _resize_axes(self):
-        self.scene.remove(self.axes)
+        # Only remove old axes if we've already been added to the scene
+        if len(self.scene.children) > 0:
+            try:
+                self.scene.remove(self.axes)
+            except Exception:
+                pass
         bb = self.scene.get_bounding_box()
         if bb is None:
             return

@@ -23,10 +23,7 @@ class View:
 
         addr_file = tempfile.mktemp(prefix="ezcad_addr_")
 
-        self._headless = (
-            os.environ.get("EZCAD_HEADLESS") == "1"
-            or os.environ.get("DISPLAY") is None
-        )
+        self._headless = os.environ.get("EZCAD_HEADLESS") == "1"
 
         proc = Process(
             target=_launch_headless if self._headless else _launch,
