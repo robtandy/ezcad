@@ -20,6 +20,7 @@ class ViewBkg:
     def run(self, address, server=None):
         self._server = server or MpRpcServer(address)
         self._register_handlers()
+        self._server.start()
         self._display = gfx.Display(
             before_render=self._before_render,
             after_render=self._after_render, stats=True)
@@ -69,7 +70,7 @@ class ViewBkg:
             self.render.lock.release_write()
 
     def _register_handlers(self):
-        w, rd, s = self.world, self.render, self._server
+        w, rd, s = self.world, self.render, [0]  # dummy to avoid name clash
 
         def _make(kind, **kw):
             if kind == "box": uid = w.make_box(kw["extents"])
@@ -104,21 +105,22 @@ class ViewBkg:
             try: rd.remove_mesh(uid)
             finally: rd.lock.release_write()
 
-        s.register("make_box",          lambda e: _make("box", extents=e))
-        s.register("make_sphere",       lambda r=1.0: _make("sphere", radius=r))
-        s.register("make_cylinder",     lambda r=1.0,h=1.0: _make("cylinder", radius=r, height=h))
-        s.register("make_cone",         lambda r=1.0,h=1.0: _make("cone", radius=r, height=h))
-        s.register("make_torus",        lambda R=1.0,r=0.25: _make("torus", major_radius=R, minor_radius=r))
-        s.register("mesh_get",          lambda uid,attr: w.mesh_get(uid, attr))
-        s.register("mesh_set",          _mesh_set)
-        s.register("mesh_call",         _mesh_call)
-        s.register("section",           lambda uid,plane="z",value=0.0: w.meshes[uid].section_vertices(plane, value))
-        s.register("delete_mesh",       _del)
-        s.register("make_circle",       lambda r=1.0,s=64: w.make_circle(r,s))
-        s.register("make_rect",         lambda w2=1.0,h=1.0: w.make_rect(w2,h))
-        s.register("make_ngon",         lambda r=1.0,s=6: w.make_ngon(r,s))
-        s.register("profile_get",       lambda uid,attr: w.profile_get(uid, attr))
-        s.register("quit",              lambda: self._server.stop())
+        srv = self._server
+        srv.register("make_box",          lambda e: _make("box", extents=e))
+        srv.register("make_sphere",       lambda r=1.0: _make("sphere", radius=r))
+        srv.register("make_cylinder",     lambda r=1.0,h=1.0: _make("cylinder", radius=r, height=h))
+        srv.register("make_cone",         lambda r=1.0,h=1.0: _make("cone", radius=r, height=h))
+        srv.register("make_torus",        lambda R=1.0,r=0.25: _make("torus", major_radius=R, minor_radius=r))
+        srv.register("mesh_get",          lambda uid,attr: w.mesh_get(uid, attr))
+        srv.register("mesh_set",          _mesh_set)
+        srv.register("mesh_call",         _mesh_call)
+        srv.register("section",           lambda uid,plane="z",value=0.0: w.meshes[uid].section_vertices(plane, value))
+        srv.register("delete_mesh",       _del)
+        srv.register("make_circle",       lambda r=1.0,s=64: w.make_circle(r,s))
+        srv.register("make_rect",         lambda w2=1.0,h=1.0: w.make_rect(w2,h))
+        srv.register("make_ngon",         lambda r=1.0,s=6: w.make_ngon(r,s))
+        srv.register("profile_get",       lambda uid,attr: w.profile_get(uid, attr))
+        srv.register("quit",              lambda: self._server.stop())
 
 
 def run_server(address, _external_listener=None):
