@@ -2,14 +2,20 @@
 
 import os
 import time
-import tempfile
+import socket
 
-# Import subpackages so ezcad.d3 and ezcad.d2 are accessible
 from . import d2  # noqa
-from . import d3   # noqa
+from . import d3  # noqa
 from .rpc import MpRpcClient
 
 _view = None
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('localhost', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
 
 
 class View:
@@ -21,13 +27,12 @@ class View:
 
         from multiprocessing import Process
 
-        addr_file = tempfile.mktemp(prefix="ezcad_addr_")
-
+        port = _free_port()
         self._headless = os.environ.get("EZCAD_HEADLESS") == "1"
 
         proc = Process(
             target=_launch_headless if self._headless else _launch,
-            args=(addr_file,),
+            args=(port,),
             daemon=True,
         )
         proc.start()
@@ -37,10 +42,7 @@ class View:
         for _ in range(50):
             time.sleep(0.1)
             try:
-                address = _read_addr(addr_file)
-                if address is None:
-                    continue
-                self._client = MpRpcClient(address)
+                self._client = MpRpcClient(('localhost', port))
                 uid = self._client.call("make_box", [1, 1, 1])
                 self._client.call("delete_mesh", uid)
                 break
@@ -65,36 +67,13 @@ class View:
         return self._client
 
 
-def _read_addr(path):
-    try:
-        with open(path) as f:
-            line = f.read().strip()
-            if not line:
-                return None
-            return eval(line)
-    except (FileNotFoundError, SyntaxError):
-        return None
-
-
-def _launch(addr_file):
+def _launch(port):
     import warnings
     warnings.filterwarnings("ignore", message="invalid value encountered in")
-    from multiprocessing.connection import Listener
     from .server.backend import run_server
-
-    listener = Listener(("localhost", 0), authkey=b"ezcad")
-    address = listener.address
-    with open(addr_file, "w") as f:
-        f.write(repr(address))
-    run_server(address, _external_listener=listener)
+    run_server(('localhost', port))
 
 
-def _launch_headless(addr_file):
-    from multiprocessing.connection import Listener
+def _launch_headless(port):
     from .server.backend import run_headless
-
-    listener = Listener(("localhost", 0), authkey=b"ezcad")
-    address = listener.address
-    with open(addr_file, "w") as f:
-        f.write(repr(address))
-    run_headless(address, _external_listener=listener)
+    run_headless(('localhost', port))
