@@ -1,26 +1,22 @@
 """Pie menu: cascading donut rings with icon-only slices.
 
-Callbacks fire on the **client** process.  The server resolves a leaf click
-and sends the ``action_name`` back.  The client looks up the registered
-callable and invokes it.
+All rendering and interaction happens server-side, in the viewbkg process.
 """
 
 import math
 import numpy as np
 import pygfx as gfx
 from .d2 import Profile
-from .rpc import RpcError
 
 
 # ---------------------------------------------------------------------------
-# _MenuSpec — lightweight, picklable description of a menu item
+# _MenuSpec — lightweight description of a menu item (used on both sides)
 # ---------------------------------------------------------------------------
 
 class _MenuSpec:
-    """Serialisable description of one pie-menu slice.
-
+    """
     ``icon_verts`` — list of (x, y) points for the icon, or None
-    ``action``     — string name identifying the client-side callable
+    ``action``     — name used purely as a label for now
     ``children``   — list of child _MenuSpec, or None
     """
 
@@ -31,22 +27,17 @@ class _MenuSpec:
             self.icon_verts = None
         self.action = action or ""
         self.children = (
-            [_MenuSpec(**_spec_dict(c)) for c in children]
+            [_MenuSpec(
+                icon_verts=None if (c.icon is None or len(c.icon.verts) < 3) else c.icon.verts.tolist(),
+                action=c.action,
+                children=c.children) for c in children]
             if children and len(children)
             else None
         )
 
 
-def _spec_dict(s):
-    """Convert a _MenuSpec or dict to kwargs."""
-    if isinstance(s, _MenuSpec):
-        return {"icon_verts": s.icon_verts, "action": s.action,
-                "children": s.children}
-    return s
-
-
 # ---------------------------------------------------------------------------
-# PieMenu (server-side renderer; event-driven, no cross-process calls)
+# PieMenu  (server-side only; lives in render thread)
 # ---------------------------------------------------------------------------
 
 class PieMenu:
@@ -54,38 +45,27 @@ class PieMenu:
 
     All rings share the same centre.  Ring 0 appears on request.
     Hovering a slice of ring *N* reveals ring *N+1* outside it.
-    Clicking a leaf sends the action name to the event handler.
     """
 
-    RING_W      = 55.0    # radial thickness per ring (screen px)
-    SLICE_GAP   = 0.03    # rad gap between slices
-    ICON_SCALE  = 0.45    # icon profile scale factor
-    RING1_INNER = 30.0    # inner radius of first ring
+    RING_W      = 55.0
+    SLICE_GAP   = 0.03
+    ICON_SCALE  = 0.45
+    RING1_INNER = 30.0
     SEG_PER_RAD = 10
 
-    def __init__(self, on_click):
-        """
-        Parameters
-        ----------
-        on_click : callable(action_name, x, y, hit_uid|None)
-            Called when a leaf slice is clicked on the **server** side.
-            This function is responsible for forwarding the result
-            to the client process.
-        """
-        self.on_click = on_click
+    def __init__(self):
         self.open = False
         self.center = (0.0, 0.0)
         self.scene: gfx.Scene | None = None
         self.group: gfx.Group | None = None
-        self._specs = []
+        self._specs: list[_MenuSpec] = []
         self._wedges: list[gfx.Mesh] = []
         self._icons: list[gfx.Mesh] = []
         self.hover_path: list[int] = []
 
-    # ---- public API -------------------------------------------------------
-
     def open_at(self, x: float, y: float, scene: gfx.Scene,
                 specs: list[_MenuSpec]):
+        self.close()
         self.open = True
         self.center = (x, y)
         self.scene = scene
@@ -107,36 +87,21 @@ class PieMenu:
         self.open = False
 
     def handle_mouse(self, x: float, y: float):
-        """Update hover highlight from cursor position."""
         if not self.open:
             return
         path = self._path_for_point(x, y)
         if path is not None:
             self.hover_path = path
             self._rebuild()
+            return True
+        return False
 
-    def handle_click(self, x: float, y: float, hit_uid: str | None = None):
-        """If a leaf action is under the cursor, dispatch on_click."""
+    def handle_click(self, x: float, y: float) -> bool:
         if not self.open:
             return False
         path = self._path_for_point(x, y)
-        if not path:
-            self.close()
-            return True
-        specs = self._specs
-        for idx in path:
-            if idx < 0 or idx >= len(specs):
-                self.close()
-                return True
-            spec = specs[idx]
-            has_children = spec.children and len(spec.children) > 0
-            if not has_children and spec.action:
-                self.close()
-                self.on_click(spec.action, x, y, hit_uid)
-                return True
-            specs = spec.children or []
         self.close()
-        return True
+        return path is not None
 
     # ---- internals --------------------------------------------------------
 

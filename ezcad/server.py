@@ -17,9 +17,16 @@ import uuid
 import numpy as np
 import trimesh
 import pygfx as gfx
+from shapely.geometry import Polygon
 
 from .rpc import MpRpcServer
 from .menu import PieMenu, _MenuSpec
+
+
+def _simple_icon():
+    """A small square profile for use as a menu icon placeholder."""
+    from .d2 import Profile
+    return Profile([(-10, -10), (10, -10), (10, 10), (-10, 10)])
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +184,9 @@ class World:
                 major_radius=major_radius, minor_radius=minor_radius))
         return uid
 
+    def delete_mesh(self, uid):
+        self.meshes.pop(uid, None)
+
     def mesh_get(self, uid, attr):
         return getattr(self.meshes[uid], attr)
 
@@ -195,10 +205,7 @@ class World:
 # ViewBkg – the server subprocess entry point
 # ---------------------------------------------------------------------------
 
-from shapely.geometry import Polygon  # noqa: E402
-
-
-def run_server(address: tuple = ("localhost", 0), event_queue=None):
+def run_server(address: tuple = ("localhost", 0)):
     world = World()
     rw_lock = RWLock()
 
@@ -231,6 +238,7 @@ def run_server(address: tuple = ("localhost", 0), event_queue=None):
         scene.add(axes_ref[0])
 
     def _sync_mesh_to_render(uid):
+        """Must be called WITH the write lock held."""
         sm = world.meshes.get(uid)
         if sm is None:
             return
@@ -261,17 +269,52 @@ def run_server(address: tuple = ("localhost", 0), event_queue=None):
                     return u
         return None
 
-    # ── Pie menu ────────────────────────────────────────────────────
-    def _on_menu_click(action_name, x, y, hit_uid):
-        if event_queue is not None:
+    # ── Pie menu (hardcoded for now) ────────────────────────────────
+
+    menu = PieMenu()
+    menu_open = [False]
+
+    def _make_menu_specs():
+        return [_MenuSpec(icon=_simple_icon()) for _ in range(5)]
+
+    # ── event handlers ──────────────────────────────────────────────
+
+    renderer_ref = [None]
+
+    def _on_pointer(event):
+        x, y = event.x, event.y
+        button = getattr(event, "button", -1)
+        is_right = button == 2
+
+        if menu_open[0]:
+            if event.type == "pointer_move":
+                menu.handle_mouse(x, y)
+            elif is_right:
+                menu.close()
+                menu_open[0] = False
+            else:
+                menu.handle_click(x, y)
+                menu_open[0] = False
+            return
+
+        if is_right:
+            menu.open_at(x, y, screen_scene, _make_menu_specs())
+            menu_open[0] = True
+
+    def _before_render_with_events():
+        if renderer_ref[0] is None and display.renderer:
+            renderer_ref[0] = display.renderer
+            display.renderer.add_event_handler(
+                _on_pointer, "pointer_up", "pointer_move")
+        rw_lock.acquire_read()
+
+    def _after_render_composite():
+        if menu_open[0] and renderer_ref[0]:
             try:
-                event_queue.put(("menu_click", action_name, x, y, hit_uid))
+                renderer_ref[0].render(screen_scene, screen_camera)
             except Exception:
                 pass
-
-    menu = PieMenu(on_click=_on_menu_click)
-    menu_specs = []
-    menu_open = [False]
+        rw_lock.release_read()
 
     # ── RPC handlers ────────────────────────────────────────────────
 
@@ -295,48 +338,6 @@ def run_server(address: tuple = ("localhost", 0), event_queue=None):
         finally:
             rw_lock.release_write()
         return uid
-
-    renderer_ref = [None]
-
-    def _on_pointer(event):
-        x, y = event.x, event.y
-        button = getattr(event, "button", -1)
-        is_right = button == 2
-        is_left = button == 0
-
-        if not menu_open[0]:
-            # right-click opens menu
-            if is_right and event.type == "pointer_up":
-                if menu_specs:
-                    menu.open_at(x, y, screen_scene, menu_specs[:])
-                    menu_open[0] = True
-                return
-        else:
-            # menu is open
-            if event.type == "pointer_move":
-                menu.handle_mouse(x, y)
-            elif is_right and event.type == "pointer_up":
-                menu.close()
-                menu_open[0] = False
-            elif is_left and event.type == "pointer_up":
-                hit_uid = _pick_uid(x, y, renderer_ref[0])
-                menu.handle_click(x, y, hit_uid)
-            return
-
-    def _before_render_with_events():
-        if renderer_ref[0] is None and display.renderer:
-            renderer_ref[0] = display.renderer
-            display.renderer.add_event_handler(
-                _on_pointer, "pointer_up", "pointer_move")
-        rw_lock.acquire_read()
-
-    def _after_render_composite():
-        if menu_open[0] and renderer_ref[0]:
-            try:
-                renderer_ref[0].render(screen_scene, screen_camera)
-            except Exception:
-                pass
-        rw_lock.release_read()
 
     def _mesh_get(uid, attr):
         return world.mesh_get(uid, attr)
@@ -365,9 +366,17 @@ def run_server(address: tuple = ("localhost", 0), event_queue=None):
     def _section(uid, plane="z", value=0.0):
         return world.meshes[uid].section_vertices(plane, value)
 
-    def _register_menu(specs):
-        nonlocal menu_specs
-        menu_specs = specs
+    def _delete_mesh(uid):
+        world.delete_mesh(uid)
+        rw_lock.acquire_write()
+        try:
+            gmesh = _gfx_map.get(uid)
+            if gmesh is not None:
+                scene.remove(gmesh)
+                del _gfx_map[uid]
+            _update_axes(scene.get_bounding_box())
+        finally:
+            rw_lock.release_write()
 
     server = MpRpcServer(address)
     server.register("make_box", lambda e: _rpc_make("box", extents=e))
@@ -382,7 +391,7 @@ def run_server(address: tuple = ("localhost", 0), event_queue=None):
     server.register("mesh_set", _mesh_set)
     server.register("mesh_call", _mesh_call)
     server.register("section", _section)
-    server.register("register_menu", _register_menu)
+    server.register("delete_mesh", _delete_mesh)
     server.register("quit", lambda: server.stop())
 
     bound_addr = server.start()
@@ -393,6 +402,68 @@ def run_server(address: tuple = ("localhost", 0), event_queue=None):
         stats=True,
     )
     display.show(scene)
+    server.stop()
+
+
+def run_headless(address: tuple = ("localhost", 0)):
+    """Pure-RPC server with no pygfx render loop.  Used for headless tests."""
+    world = World()
+    rw_lock = RWLock()
+
+    def _rpc_make(kind, **kw):
+        if kind == "box":
+            uid = world.make_box(kw["extents"])
+        elif kind == "sphere":
+            uid = world.make_sphere(kw.get("radius", 1.0))
+        elif kind == "cylinder":
+            uid = world.make_cylinder(kw.get("radius", 1.0), kw.get("height", 1.0))
+        elif kind == "cone":
+            uid = world.make_cone(kw.get("radius", 1.0), kw.get("height", 1.0))
+        elif kind == "torus":
+            uid = world.make_torus(kw.get("major_radius", 1.0),
+                                   kw.get("minor_radius", 0.25))
+        else:
+            raise ValueError(f"Unknown kind: {kind}")
+        return uid
+
+    def _mesh_get(uid, attr):
+        return world.mesh_get(uid, attr)
+
+    def _mesh_set(uid, attr, value):
+        world.mesh_set(uid, attr, value)
+
+    def _mesh_call(uid, method, args=(), kwargs=None):
+        return world.mesh_call(uid, method, args=args, kwargs=kwargs)
+
+    def _section(uid, plane="z", value=0.0):
+        return world.meshes[uid].section_vertices(plane, value)
+
+    def _delete_mesh(uid):
+        world.delete_mesh(uid)
+
+    server = MpRpcServer(address)
+    server.register("make_box", lambda e: _rpc_make("box", extents=e))
+    server.register("make_sphere", lambda r=1.0: _rpc_make("sphere", radius=r))
+    server.register("make_cylinder", lambda r=1.0, h=1.0: _rpc_make(
+        "cylinder", radius=r, height=h))
+    server.register("make_cone", lambda r=1.0, h=1.0: _rpc_make(
+        "cone", radius=r, height=h))
+    server.register("make_torus", lambda R=1.0, r=0.25: _rpc_make(
+        "torus", major_radius=R, minor_radius=r))
+    server.register("mesh_get", _mesh_get)
+    server.register("mesh_set", _mesh_set)
+    server.register("mesh_call", _mesh_call)
+    server.register("section", _section)
+    server.register("delete_mesh", _delete_mesh)
+    server.register("quit", lambda: server.stop())
+
+    server.start()
+    import time
+    try:
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
     server.stop()
 
 
