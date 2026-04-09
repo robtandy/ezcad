@@ -91,7 +91,7 @@ class PieMenu:
                         gfx.MeshBasicMaterial(color=color, side="front"))
 
     def _icon(self, verts_xy, angle, radius):
-        v = np.array(verts_xy) * self.ICON_SCALE
+        v = np.array(verts_xy, dtype=np.float32) * self.ICON_SCALE
         cx, cy = radius*math.cos(angle), radius*math.sin(angle)
         iv = np.column_stack([v[:, 0]+cx, v[:, 1]+cy, np.zeros(len(v), dtype=np.float32)])
         ic = []

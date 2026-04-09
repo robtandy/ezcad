@@ -24,12 +24,17 @@ class ViewBkg:
         self._display = gfx.Display(
             before_render=self._before_render,
             after_render=self._after_render, stats=True)
-        # Add a tiny invisible sphere so show() always finds a bounding sphere
+        # Tiny invisible sphere so show() can compute a bounding sphere
         ph = gfx.Mesh(
             gfx.sphere_geometry(0.01),
             gfx.MeshBasicMaterial())
         ph.visible = False
         self.render.scene.add(ph)
+
+        # Ambient light so PhongMaterial actually shows something
+        self.render.scene.add(gfx.AmbientLight())
+        self.render.scene.add(gfx.DirectionalLight())
+
         self._display.show(self.render.scene)
         self.render.scene.remove(ph)
         self.render.scene.remove(ph)
