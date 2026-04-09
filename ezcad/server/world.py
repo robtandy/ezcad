@@ -1,7 +1,4 @@
-"""World — domain objects, owned exclusively by the RPC handler thread.
-
-No locking needed; this module is only accessed from one thread.
-"""
+"""World — domain objects, owned exclusively by the RPC thread."""
 
 import math
 import uuid
@@ -12,7 +9,7 @@ from shapely.geometry import Polygon
 
 
 class MeshImpl:
-    """Full 3D mesh backed by ``trimesh.Trimesh``."""
+    """Full 3D mesh backed by trimesh.Trimesh."""
 
     def __init__(self, uid: str, mesh: trimesh.Trimesh):
         self.uid = uid
@@ -20,8 +17,6 @@ class MeshImpl:
         self.pos = [0.0, 0.0, 0.0]
         self.visible = True
         self.color = "#336699"
-
-    # -- transforms --
 
     def translate(self, vec):
         tm = trimesh.transformations.translation_matrix(vec)
@@ -50,8 +45,6 @@ class MeshImpl:
                 verts[:, i] = -verts[:, i]
         self._mesh.vertices = verts
 
-    # -- CSG --
-
     def union(self, other_uid, world):
         self._mesh = self._mesh.union(world.meshes[other_uid]._mesh)
 
@@ -61,8 +54,6 @@ class MeshImpl:
     def intersection(self, other_uid, world):
         self._mesh = self._mesh.intersection(world.meshes[other_uid]._mesh)
 
-    # -- query --
-
     @property
     def volume(self):
         return self._mesh.volume
@@ -71,21 +62,12 @@ class MeshImpl:
     def area(self):
         return self._mesh.area
 
-    def mass(self, density=1.0):
-        return self._mesh.volume * density
-
     def bounds(self):
         return self._mesh.bounds.tolist()
 
-    # -- 2D cross-section --
-
     def section_vertices(self, plane="z", value=0.0):
         normal = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}[plane]
-        origin_map = {
-            "x": [value, 0, 0],
-            "y": [0, value, 0],
-            "z": [0, 0, value],
-        }
+        origin_map = {"x": [value, 0, 0], "y": [0, value, 0], "z": [0, 0, value]}
         section = self._mesh.section(
             plane_origin=origin_map[plane], plane_normal=normal)
         if section is None or section.is_empty:
@@ -127,16 +109,12 @@ class ProfileImpl:
         return self._verts.tolist()
 
 
-# ---------------------------------------------------------------------------
-# World  — container for all domain objects
-# ---------------------------------------------------------------------------
-
 class World:
+    """Container for all domain objects.  Only accessed from RPC thread."""
+
     def __init__(self):
         self.meshes: dict[str, MeshImpl] = {}
         self.profiles: dict[str, ProfileImpl] = {}
-
-    # -- mesh constructors --
 
     def make_box(self, extents):
         uid = _uid()
@@ -170,8 +148,6 @@ class World:
     def delete_mesh(self, uid):
         self.meshes.pop(uid, None)
 
-    # -- profile constructors --
-
     def make_circle(self, radius=1.0, segments=64):
         uid = _uid()
         theta = np.linspace(0, 2 * math.pi, segments, endpoint=False)
@@ -193,8 +169,6 @@ class World:
         self.profiles[uid] = ProfileImpl(uid, verts)
         return uid
 
-    # -- generic dispatch --
-
     def mesh_get(self, uid, attr):
         return getattr(self.meshes[uid], attr)
 
@@ -211,14 +185,6 @@ class World:
     def profile_get(self, uid, attr):
         return getattr(self.profiles[uid], attr)
 
-    def profile_call(self, uid, method, args=(), kwargs=None):
-        m = self.profiles[uid]
-        return getattr(m, method)(*args, **(kwargs or {}))
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def _uid():
     return str(uuid.uuid4())[:8]
