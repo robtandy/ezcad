@@ -31,7 +31,7 @@ class RpcServer(ABC):
     @abstractmethod
     def register(self, name: str, handler): ...
     @abstractmethod
-    def start(self) -> tuple: ...    # returns bound address
+    def start(self) -> tuple: ...
     @abstractmethod
     def stop(self): ...
 
@@ -68,7 +68,8 @@ class MpRpcServer(RpcServer):
         self._handlers[name] = handler
 
     def start(self) -> tuple:
-        self._listener = Listener(self._address, authkey=b"ezcad")
+        if self._listener is None:
+            self._listener = Listener(self._address, authkey=b"ezcad")
         self._running = True
         self._thread = Thread(target=self._serve, daemon=True)
         self._thread.start()

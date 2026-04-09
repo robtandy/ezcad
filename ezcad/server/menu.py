@@ -1,51 +1,24 @@
-"""Pie menu: cascading donut rings with icon-only slices.
+"""PieMenu — screen-space cascading donut-ring menus, client-side free.
 
-All rendering and interaction happens server-side, in the viewbkg process.
+All rendering and hover interaction happen in the render thread.
+Callbacks (when the menu is ready) will also fire on the render thread.
 """
 
 import math
 import numpy as np
 import pygfx as gfx
-from .d2 import Profile
 
-
-# ---------------------------------------------------------------------------
-# _MenuSpec — lightweight description of a menu item (used on both sides)
-# ---------------------------------------------------------------------------
 
 class _MenuSpec:
-    """
-    ``icon_verts`` — list of (x, y) points for the icon, or None
-    ``action``     — name used purely as a label for now
-    ``children``   — list of child _MenuSpec, or None
-    """
+    """Lightweight description of one slice — picklable for RPC."""
 
-    def __init__(self, icon=None, action=None, children=None):
-        if icon is not None and len(icon.verts) >= 3:
-            self.icon_verts = icon.verts.tolist()
-        else:
-            self.icon_verts = None
-        self.action = action or ""
-        self.children = (
-            [_MenuSpec(
-                icon_verts=None if (c.icon is None or len(c.icon.verts) < 3) else c.icon.verts.tolist(),
-                action=c.action,
-                children=c.children) for c in children]
-            if children and len(children)
-            else None
-        )
+    def __init__(self, icon_verts=None, children=None):
+        self.icon_verts = icon_verts  # list of [x, y] or None
+        self.children = children or None  # list[_MenuSpec] or None
 
-
-# ---------------------------------------------------------------------------
-# PieMenu  (server-side only; lives in render thread)
-# ---------------------------------------------------------------------------
 
 class PieMenu:
-    """Screen-space cascading pie / donut menu.
-
-    All rings share the same centre.  Ring 0 appears on request.
-    Hovering a slice of ring *N* reveals ring *N+1* outside it.
-    """
+    """Screen-space cascading pie / donut menu."""
 
     RING_W      = 55.0
     SLICE_GAP   = 0.03
@@ -93,12 +66,8 @@ class PieMenu:
         if path is not None:
             self.hover_path = path
             self._rebuild()
-            return True
-        return False
 
     def handle_click(self, x: float, y: float) -> bool:
-        if not self.open:
-            return False
         path = self._path_for_point(x, y)
         self.close()
         return path is not None
