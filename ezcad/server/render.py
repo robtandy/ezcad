@@ -26,15 +26,37 @@ class RenderWorld:
         stl = mesh_impl.stl_bytes()
         tmesh = trimesh.load(io.BytesIO(stl), file_type="stl")
         geo = gfx.geometry_from_trimesh(tmesh)
-        gmesh = gfx.Mesh(geo, gfx.MeshPhongMaterial(color=mesh_impl.color))
+
+        # Surface: flat, light grey, blended
+        mat = gfx.MeshPhongMaterial(
+            color=mesh_impl.color,
+            alpha_mode="blend",
+            flat_shading=True,
+        )
+        gmesh = gfx.Mesh(geo, mat)
         gmesh.position = mesh_impl.pos
         gmesh.visible = mesh_impl.visible
+
+        # Wireframe overlay: white outline
+        wire = gfx.Mesh(
+            geo,
+            gfx.MeshBasicMaterial(
+                wireframe=True,
+                wireframe_thickness=1.5,
+                color="#FFFFFF",
+            ),
+        )
+        wire.position = mesh_impl.pos
+
         old = self.gfx_map.get(mesh_impl.uid)
         if old is not None:
             self.scene.remove(old)
-        self.scene.add(gmesh)
-        self.gfx_map[mesh_impl.uid] = gmesh
-        # Defer axes resize until there's actual content
+
+        group = gfx.Group()
+        group.add(gmesh)
+        group.add(wire)
+        self.scene.add(group)
+        self.gfx_map[mesh_impl.uid] = group
         if len(self.gfx_map) > 0:
             self._resize_axes()
 
