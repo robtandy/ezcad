@@ -1,93 +1,179 @@
-"""World — domain objects, owned exclusively by the RPC thread."""
+"""World — exact CAD kernel + domain objects, owned exclusively by the RPC thread."""
 
 import math
 import uuid
+import rpyc
 
 import numpy as np
-import trimesh
 from shapely.geometry import Polygon
 
+from build123d import (
+    Box,
+    Sphere,
+    Cylinder,
+    Cone,
+    Torus,
+    Plane,
+    Location,
+    Axis,
+    Shape,
+    section as b123_section,
+)
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.GCPnts import GCPnts_UniformAbscissa
 
-class MeshImpl:
-    """Full 3D mesh backed by trimesh.Trimesh."""
+from .messages import Viewable
 
-    def __init__(self, uid: str, mesh: trimesh.Trimesh):
+# ─── Visual defaults ─────────────────────────────────────────────────────────
+
+DEFAULT_ALPHA_MODE = "auto"
+
+
+def _resolve_alpha(global_alpha: str, override: str | None) -> str:
+    """Return the effective alpha mode: override if set, else global."""
+    return override if override is not None else global_alpha
+
+
+def _tessellate_solid(shape):
+    """Tessellate a build123d Shape into positions/faces/normals arrays.
+
+    build123d's .tessellate(deflection) returns (vertices, faces).
+    Each face is a tuple of 3 indices into the vertex list.
+    Also computes flat face normals from the triangle winding.
+    """
+    verts, faces = shape.tessellate(0.01)
+    if not verts:
+        return [], [], []
+    positions = np.array([[v.X, v.Y, v.Z] for v in verts], dtype=np.float32)
+    indices = np.array(faces, dtype=np.uint32)
+
+    # Compute flat normals: one 3D normal per face, repeated 3 times
+    face_normals = np.zeros((len(faces) * 3, 3), dtype=np.float32)
+    for i, (a, b, c) in enumerate(faces):
+        v0, v1, v2 = positions[a], positions[b], positions[c]
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        normal = np.cross(edge1, edge2)
+        norm = np.linalg.norm(normal)
+        if norm > 1e-12:
+            normal /= norm
+        face_normals[i * 3] = face_normals[i * 3 + 1] = face_normals[i * 3 + 2] = normal
+
+    return positions, indices, face_normals
+
+
+class Solid:
+    """Exact solid backed by build123d Shape."""
+
+    def __init__(self, uid: str, shape: Shape):
         self.uid = uid
-        self._mesh = mesh
-        self.pos = [0.0, 0.0, 0.0]
+        self._shape = shape
         self.visible = True
-        self.color = "#336699"
+        self.color = 0.13, 0.26, 0.52, 0.5
+        self.visual_alpha_mode: str | None = None  # None ⇒ inherit global
 
+    @property
+    @rpyc.exposed
+    def position(self) -> tuple[int | float, int | float, int | float]:
+        return self._shape.position.to_tuple()
+
+    @property
+    def mesh(self):
+        """Lazily tessellate to (positions, indices, face_normals) for pygfx."""
+        return _tessellate_solid(self._shape)
+
+    @rpyc.exposed
     def translate(self, vec):
-        tm = trimesh.transformations.translation_matrix(vec)
-        self._mesh.apply_transform(tm)
+        loc = Location(tuple(vec))
+        self._shape = self._shape.move(loc)
         self.pos = [self.pos[i] + vec[i] for i in range(3)]
 
+    @rpyc.exposed
     def rotate(self, axis, degrees=0, radians=0):
-        rad = radians if radians != 0 else degrees * math.pi / 180.0
-        tm = trimesh.transformations.rotation_matrix(rad, _axis_vec(axis))
-        self._mesh.apply_transform(tm)
+        rad = radians if radians != 0 else math.radians(degrees)
+        deg = math.degrees(rad)
+        axes = {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}
+        if isinstance(axis, str):
+            axis = axes[axis]
+        ax = Axis(origin=(0, 0, 0), direction=(*axis,))
+        self._shape = self._shape.rotate(ax, deg)
 
+    @rpyc.exposed
     def scale(self, factor):
-        if isinstance(factor, (int, float)):
-            factor = [factor, factor, factor]
-        sm = np.eye(4)
-        for i in range(3):
-            sm[i, i] = factor[i]
-        self._mesh.apply_transform(sm)
+        from build123d import scale as b123d_scale
 
+        self._shape = b123d_scale(self._shape, by=factor)
+
+    @rpyc.exposed
     def mirror(self, plane="xy"):
-        axes = {"xy": [0, 0, 1], "yz": [1, 0, 0], "xz": [0, 1, 0]}
-        n = axes[plane]
-        verts = self._mesh.vertices.copy()
-        for i, c in enumerate(n):
-            if c:
-                verts[:, i] = -verts[:, i]
-        self._mesh.vertices = verts
+        plane_map = {
+            "xy": Plane((0, 0, 0), z_dir=(0, 0, 1)),
+            "yz": Plane((0, 0, 0), z_dir=(1, 0, 0)),
+            "xz": Plane((0, 0, 0), z_dir=(0, 1, 0)),
+        }
+        self._shape = self._shape.mirror(plane_map[plane])
 
+    @rpyc.exposed
     def union(self, other_uid, world):
-        self._mesh = self._mesh.union(world.meshes[other_uid]._mesh)
+        other = world.solids[other_uid]
+        self._shape = self._shape.fuse(other._shape)
 
+    @rpyc.exposed
     def difference(self, other_uid, world):
-        self._mesh = self._mesh.difference(world.meshes[other_uid]._mesh)
+        other = world.solids[other_uid]
+        self._shape = self._shape.cut(other._shape)
 
+    @rpyc.exposed
     def intersection(self, other_uid, world):
-        self._mesh = self._mesh.intersection(world.meshes[other_uid]._mesh)
+        other = world.solids[other_uid]
+        self._shape = self._shape.intersect(other._shape)
 
     @property
+    @rpyc.exposed
     def volume(self):
-        return self._mesh.volume
+        return self._shape.volume
 
     @property
+    @rpyc.exposed
     def area(self):
-        return self._mesh.area
+        return self._shape.area
 
+    @property
+    @rpyc.exposed
     def bounds(self):
-        return self._mesh.bounds.tolist()
+        bb = self._shape.bounding_box()
+        return [[bb.min.X, bb.min.Y, bb.min.Z], [bb.max.X, bb.max.Y, bb.max.Z]]
 
-    def section_vertices(self, plane="z", value=0.0):
+    @rpyc.exposed
+    def section(self, plane="z", value=0.0):
         normal = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}[plane]
-        origin_map = {"x": [value, 0, 0], "y": [0, value, 0], "z": [0, 0, value]}
-        section = self._mesh.section(
-            plane_origin=origin_map[plane], plane_normal=normal)
-        if section is None or section.is_empty:
+        origin_pt = {"x": [value, 0, 0], "y": [0, value, 0], "z": [0, 0, value]}[plane]
+        cut = b123_section(self._shape, Plane((*origin_pt,), z_dir=(*normal,)))
+        if cut is None or list(cut.edges()) == []:
             return None
-        polygons = []
-        for entity in section.entities:
-            pts = section.vertices[entity.points][:, :2]
-            if len(pts) >= 3:
-                poly = Polygon(pts)
-                if poly.area > 0:
-                    polygons.append(poly)
-        if not polygons:
+        coords = []
+        for edge in cut.edges():
+            curve = BRepAdaptor_Curve(edge.wrapped)
+            pts = GCPnts_UniformAbscissa(curve, 16)
+            for i in range(1, pts.NbPoints() + 1):
+                v = curve.Value(pts.Parameter(i))
+                coords.append((v.X(), v.Y()))
+        if not coords:
             return None
-        merged = polygons[0]
-        for p in polygons[1:]:
-            merged = merged.union(p)
-        return list(merged.exterior.coords)
+        return coords
 
-    def stl_bytes(self):
-        return self._mesh.export(file_type="stl")
+    def to_viewable(self) -> Viewable:
+        positions, indices, normals = _tessellate_solid(self._shape)
+        return Viewable(
+            uid=self.uid,
+            positions=positions,
+            indices=indices,
+            normals=normals,
+            pos=self.pos,
+            visible=self.visible,
+            color=self.color,
+            visible_alpha_mode=self.visible.alpha_mode,
+        )
 
 
 class ProfileImpl:
@@ -109,88 +195,47 @@ class ProfileImpl:
         return self._verts.tolist()
 
 
-class World:
+@rpyc.service
+class World(rpyc.Service):
     """Container for all domain objects.  Only accessed from RPC thread."""
 
-    def __init__(self):
-        self.meshes: dict[str, MeshImpl] = {}
+    def __init__(self, rworld):  # note what is the type of rworld?
+        self.solids: dict[str, Solid] = {}
         self.profiles: dict[str, ProfileImpl] = {}
+        self.visual_alpha_mode: str = DEFAULT_ALPHA_MODE
+        self.rworld = rworld
 
-    def make_box(self, extents):
+    def add_solid(self, shape: Shape):
         uid = _uid()
-        self.meshes[uid] = MeshImpl(uid, trimesh.creation.box(extents=extents))
-        return uid
+        solid = Solid(uid, shape)
+        self.solids[uid] = solid
+        self.rworld.add(solid.to_viewable())
+        return solid
 
-    def make_sphere(self, radius=1.0):
-        uid = _uid()
-        self.meshes[uid] = MeshImpl(uid, trimesh.creation.uv_sphere(radius=radius))
-        return uid
+    @rpyc.exposed
+    def box(self, extents):
+        return self.add_solid(Box(*extents))
 
-    def make_cylinder(self, radius=1.0, height=1.0):
-        uid = _uid()
-        self.meshes[uid] = MeshImpl(
-            uid, trimesh.creation.cylinder(radius=radius, height=height))
-        return uid
+    @rpyc.exposed
+    def sphere(self, radius=1.0):
+        return self.add_solid(Sphere(radius))
 
-    def make_cone(self, radius=1.0, height=1.0):
-        uid = _uid()
-        self.meshes[uid] = MeshImpl(
-            uid, trimesh.creation.cone(radius=radius, height=height))
-        return uid
+    @rpyc.exposed
+    def cylinder(self, radius=1.0, height=1.0):
+        return self.add_solid(Cylinder(radius, height))
 
-    def make_torus(self, major_radius=1.0, minor_radius=0.25):
-        uid = _uid()
-        self.meshes[uid] = MeshImpl(
-            uid, trimesh.creation.torus(
-                major_radius=major_radius, minor_radius=minor_radius))
-        return uid
+    @rpyc.exposed
+    def cone(self, radius=1.0, height=1.0):
+        return self.add_solid(Cone(radius, 0, height))
 
-    def delete_mesh(self, uid):
-        self.meshes.pop(uid, None)
+    @rpyc.exposed
+    def torus(self, major_radius=1.0, minor_radius=0.25):
+        return self.add_solid(Torus(major_radius, minor_radius))
 
-    def make_circle(self, radius=1.0, segments=64):
-        uid = _uid()
-        theta = np.linspace(0, 2 * math.pi, segments, endpoint=False)
-        verts = np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
-        self.profiles[uid] = ProfileImpl(uid, verts)
-        return uid
-
-    def make_rect(self, width=1.0, height=1.0):
-        uid = _uid()
-        hw, hh = width / 2, height / 2
-        verts = np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]])
-        self.profiles[uid] = ProfileImpl(uid, verts)
-        return uid
-
-    def make_ngon(self, radius=1.0, sides=6):
-        uid = _uid()
-        theta = np.linspace(0, 2 * math.pi, sides, endpoint=False)
-        verts = np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
-        self.profiles[uid] = ProfileImpl(uid, verts)
-        return uid
-
-    def mesh_get(self, uid, attr):
-        return getattr(self.meshes[uid], attr)
-
-    def mesh_set(self, uid, attr, value):
-        setattr(self.meshes[uid], attr, value)
-
-    def mesh_call(self, uid, method, args=(), kwargs=None):
-        m = self.meshes[uid]
-        fn = getattr(m, method)
-        if method in ("union", "difference", "intersection"):
-            return fn(args[0], self)
-        return fn(*args, **(kwargs or {}))
-
-    def profile_get(self, uid, attr):
-        return getattr(self.profiles[uid], attr)
+    @rpyc.exposed
+    def delete(self, uid):
+        self.solids.pop(uid, None)
 
 
 def _uid():
     return str(uuid.uuid4())[:8]
-
-
-def _axis_vec(axis):
-    if isinstance(axis, str):
-        return {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}[axis]
-    return list(axis)
